@@ -1,18 +1,22 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import torch
-from unsloth import FastLanguageModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
 import boto3
 import os
 
-app = FastAPI(title="Qwen Interview Generator")
+app = FastAPI(title="Qwen Interview Generator (CPU)")
 
 # -------------------------
 # CONFIG
 # -------------------------
 BUCKET_NAME = "llm-prod-models"
 S3_PREFIX = "Questions_finetuning_Qwen_model"
-LOCAL_MODEL_DIR = "./model"
+LOCAL_MODEL_DIR = "./lora"
+BASE_MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+
+DEVICE = "cpu"
 
 # -------------------------
 # Load model on startup
@@ -39,17 +43,28 @@ def load_model():
                 f"{LOCAL_MODEL_DIR}/{file_name}"
             )
 
-    # Load base model
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name="Qwen/Qwen2.5-3B-Instruct",
-        load_in_4bit=True,
-        max_seq_length=2048,
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        BASE_MODEL_NAME,
+        trust_remote_code=True
     )
 
-    # Load LoRA
-    model.load_adapter(LOCAL_MODEL_DIR)
+    # Base model (CPU)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_NAME,
+        torch_dtype=torch.float32,
+        device_map=None,
+        trust_remote_code=True
+    )
 
-    FastLanguageModel.for_inference(model)
+    # Load LoRA adapter
+    model = PeftModel.from_pretrained(
+        base_model,
+        LOCAL_MODEL_DIR
+    )
+
+    model.to(DEVICE)
+    model.eval()
 
 # -------------------------
 # Request schema
@@ -64,6 +79,7 @@ class Request(BaseModel):
 @app.post("/generate")
 def generate_questions(req: Request):
 
+    # 🔒 UNCHANGED MESSAGE FORMAT
     messages = [
         {
             "role": "user",
@@ -71,13 +87,17 @@ def generate_questions(req: Request):
         }
     ]
 
-    text = tokenizer.apply_chat_template(
+    # Convert chat messages to text (Qwen style)
+    prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=True,
+        add_generation_prompt=True
     )
 
-    inputs = tokenizer(text, return_tensors="pt").to("cuda")
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt"
+    ).to(DEVICE)
 
     with torch.no_grad():
         outputs = model.generate(
@@ -85,9 +105,8 @@ def generate_questions(req: Request):
             max_new_tokens=150,
             temperature=0.8,
             top_p=0.9,
-            top_k=50,
             do_sample=True,
-            num_return_sequences=req.num_outputs,
+            num_return_sequences=req.num_outputs
         )
 
     results = []
